@@ -10,15 +10,17 @@ const defaults = () => ({
   goalKg: null,
   custom: { name: 'Personalizado', desc: 'Tu propio intervalo.', warmup: 180, cooldown: 120, sets: 1, rounds: 10, work: 40, rest: 20, setRest: 60, moves: ['Trabajo'] },
   settings: { sound: true, voice: true, vibrate: true },
+  reminder: { time: '19:00', days: [1, 2, 3, 4, 5], notif: false, lastNotified: null },
 });
 let S = load();
 function load() {
-  try { return Object.assign(defaults(), JSON.parse(localStorage.getItem(KEY)) || {}); }
+  try { const d = defaults(), x = Object.assign(d, JSON.parse(localStorage.getItem(KEY)) || {}); x.reminder = Object.assign(defaults().reminder, x.reminder); return x; }
   catch { return defaults(); }
 }
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify(S)); }
   catch { toast('No se pudo guardar (almacenamiento lleno)'); }
+  clearTimeout(save._t); save._t = setTimeout(() => syncReminderState(), 400);
 }
 
 // ---------------------------------------------------------------- Utilidades
@@ -757,6 +759,7 @@ function renderMas() {
       <p class="small muted" style="margin:4px 0">${esc(d.format)}</p>
       <ul>${d.items.map((it) => `<li><b>${esc(EXERCISES[it.ex].name)}</b> — ${it.sets} × ${esc(it.reps)}<br><span class="small muted">${esc(EXERCISES[it.ex].tip)}</span></li>`).join('')}</ul>
     </details>`).join('')}
+    ${reminderCard()}
     <h3 style="margin:18px 4px 8px">Guía</h3>
     ${GUIDE.map((g) => `<details class="guide"><summary>${esc(g.t)}</summary><ul>${g.p.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></details>`).join('')}
 
@@ -775,6 +778,7 @@ function renderMas() {
     </div>
     <p class="small muted" style="text-align:center">Mi Entreno · funciona sin internet una vez instalada</p>`;
   $$('[data-set-k]').forEach((inp) => inp.onchange = () => { S.settings[inp.dataset.setK] = inp.checked; save(); if (inp.checked && inp.dataset.setK === 'sound') beep(); });
+  bindReminderCard();
   $('#exp').onclick = () => {
     const blob = new Blob([JSON.stringify(S, null, 1)], { type: 'application/json' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `mi-entreno-respaldo-${ymd()}.json`;
@@ -799,9 +803,170 @@ function toggle(k, label) {
   return `<label class="toggle"><span>${label}</span><span class="switch"><input type="checkbox" data-set-k="${k}" ${S.settings[k] ? 'checked' : ''}><span></span></span></label>`;
 }
 
+// ---------------------------------------------------------------- Recordatorios
+const WD_LETTER = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
+const WD_ICS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+function reminderFor(wd) {
+  const day = wd >= 1 && wd <= 5 ? ROUTINE[wd - 1] : null;
+  if (!day) return { title: 'Hoy: caminata o descanso activo', body: 'Sal a caminar 30–60 min o haz movilidad suave.', day: null };
+  return {
+    title: `Hoy toca entrenar: ${day.title} 💪`,
+    body: `30 min de cardio (${CARDIO_PRESETS[day.cardio].name}) + fuerza: ${day.focus.toLowerCase()}.`,
+    day,
+  };
+}
+function trainedOn(date) {
+  return S.cardio.some((c) => c.date === date) || Object.values(S.logs).some((l) => l.date === date && setsDone(l) > 0);
+}
+
+function reminderCard() {
+  const r = S.reminder;
+  const order = [1, 2, 3, 4, 5, 6, 0];
+  const perm = 'Notification' in window ? Notification.permission : 'unsupported';
+  return `<h3 style="margin:18px 4px 8px">Recordatorios</h3>
+  <div class="card stack">
+    <div class="row between"><span>Hora del entreno</span><input type="time" id="remTime" value="${esc(r.time)}" class="time-in"></div>
+    <div><span class="small muted">Días</span>
+      <div class="row wrap" style="gap:6px;margin-top:6px">${order.map((d) => `<button class="chip ${r.days.includes(d) ? 'on' : ''}" data-wd="${d}">${WD_LETTER[d]}</button>`).join('')}</div></div>
+    <div style="border-top:1px solid var(--line);padding-top:12px">
+      <b>1 · Alarma en el calendario</b> <span class="badge done">recomendado</span>
+      <p class="small">Agrega eventos semanales con alarma al calendario del teléfono, con la rutina de cada día. Funciona en Android y iPhone aunque la app esté cerrada.</p>
+      <button class="btn primary block" id="remIcs">📅 Agregar al calendario</button>
+      <p class="small muted">${isIOS() ? 'En iPhone: si no se abre, abre la app desde Safari (no desde el ícono) y vuelve a tocar el botón; después toca “Agregar todo”.' : 'Se descarga un archivo .ics: ábrelo y elige tu calendario (Google Calendar o el del teléfono).'} Si cambias la hora, borra los eventos anteriores y vuelve a agregarlos.</p>
+    </div>
+    <div style="border-top:1px solid var(--line);padding-top:4px">
+      <label class="toggle"><span><b>2 · Notificaciones de la app</b><br><span class="small muted">${perm === 'denied' ? 'Bloqueadas en el navegador: actívalas desde los ajustes del sitio.' : perm === 'unsupported' ? (isIOS() ? 'En iPhone primero instala la app (Compartir → Agregar a inicio).' : 'Este navegador no soporta notificaciones.') : 'Aviso extra cuando abres la app o, en Android con la app instalada, en segundo plano (el sistema decide el momento exacto).'}</span></span>
+      <span class="switch"><input type="checkbox" id="remNotif" ${r.notif && perm === 'granted' ? 'checked' : ''} ${perm === 'unsupported' || perm === 'denied' ? 'disabled' : ''}><span></span></span></label>
+      ${r.notif && perm === 'granted' ? '<button class="btn block" id="remTest">Probar notificación</button>' : ''}
+    </div>
+  </div>`;
+}
+
+function bindReminderCard() {
+  $('#remTime').onchange = (e) => { S.reminder.time = e.target.value || '19:00'; S.reminder.lastNotified = null; save(); toast('Hora guardada'); };
+  $$('[data-wd]').forEach((b) => b.onclick = () => {
+    const d = +b.dataset.wd, days = S.reminder.days;
+    S.reminder.days = days.includes(d) ? days.filter((x) => x !== d) : [...days, d].sort();
+    save(); b.classList.toggle('on');
+  });
+  $('#remIcs').onclick = downloadICS;
+  const n = $('#remNotif');
+  n.onchange = async () => {
+    if (n.checked) {
+      const ok = await enableNotifications();
+      S.reminder.notif = ok; if (!ok) n.checked = false;
+    } else { S.reminder.notif = false; }
+    save(); renderMas();
+  };
+  const t = $('#remTest');
+  if (t) t.onclick = () => { const r = reminderFor(new Date().getDay()); notify(r.title, r.body); };
+}
+
+async function enableNotifications() {
+  if (!('Notification' in window)) { toast('Este navegador no soporta notificaciones'); return false; }
+  let p = Notification.permission;
+  if (p === 'default') p = await Notification.requestPermission();
+  if (p !== 'granted') { toast('Permiso de notificaciones denegado'); return false; }
+  // Android (app instalada): comprobación periódica en segundo plano
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    if ('periodicSync' in reg) {
+      const st = await navigator.permissions.query({ name: 'periodic-background-sync' });
+      if (st.state === 'granted') await reg.periodicSync.register('recordatorio-entreno', { minInterval: 4 * 60 * 60 * 1000 });
+    }
+  } catch {}
+  toast('Notificaciones activadas');
+  return true;
+}
+
+async function notify(title, body) {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    await reg.showNotification(title, { body, icon: 'icons/icon-192.png', badge: 'icons/icon-192.png', tag: 'recordatorio-entreno', renotify: true, vibrate: [200, 100, 200] });
+  } catch {
+    try { new Notification(title, { body, icon: 'icons/icon-192.png' }); } catch {}
+  }
+}
+
+// Revisión mientras la app está abierta (o al volver a ella)
+async function checkReminder() {
+  const r = S.reminder;
+  if (!r.notif || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const now = new Date(), today = ymd(now);
+  if (!r.days.includes(now.getDay()) || r.lastNotified === today || trainedOn(today)) return;
+  try { // ¿ya avisó el service worker hoy?
+    const res = await (await caches.open('mi-entreno-state')).match('state.json');
+    if (res && (await res.json()).lastNotified === today) { r.lastNotified = today; save(); return; }
+  } catch {}
+  const [h, m] = r.time.split(':').map(Number);
+  if (now.getHours() * 60 + now.getMinutes() < h * 60 + m) return;
+  r.lastNotified = today; save();
+  const x = reminderFor(now.getDay()); notify(x.title, x.body);
+}
+
+// Copia del estado mínimo para que el service worker pueda avisar en segundo plano
+async function syncReminderState() {
+  if (!('caches' in window)) return;
+  try {
+    const titles = {};
+    for (let wd = 0; wd < 7; wd++) titles[wd] = reminderFor(wd);
+    const trained = [];
+    for (let i = 0; i < 3; i++) { const d = new Date(); d.setDate(d.getDate() - i); if (trainedOn(ymd(d))) trained.push(ymd(d)); }
+    const data = { time: S.reminder.time, days: S.reminder.days, notif: S.reminder.notif, lastNotified: S.reminder.lastNotified, trained,
+      msgs: Object.fromEntries(Object.entries(titles).map(([k, v]) => [k, { title: v.title, body: v.body }])) };
+    const c = await caches.open('mi-entreno-state');
+    await c.put('state.json', new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json' } }));
+  } catch {}
+}
+
+// ---- Calendario (.ics)
+function icsEsc(t) { return String(t).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n'); }
+function icsFold(line) {
+  const out = []; let cur = '', bytes = 0;
+  for (const ch of line) {
+    const b = new TextEncoder().encode(ch).length;
+    if (bytes + b > 73) { out.push(cur); cur = ' '; bytes = 1; }
+    cur += ch; bytes += b;
+  }
+  out.push(cur); return out.join('\r\n');
+}
+function buildICS() {
+  const [h, m] = S.reminder.time.split(':').map(Number);
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const L = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Mi Entreno//ES', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:Mi Entreno'];
+  for (const wd of S.reminder.days) {
+    const d = new Date(); d.setHours(h, m, 0, 0);
+    d.setDate(d.getDate() + ((wd - d.getDay() + 7) % 7));
+    const dt = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}T${pad(h)}${pad(m)}00`;
+    const r = reminderFor(wd);
+    const desc = r.day
+      ? `1) Cardio 30 min: ${CARDIO_PRESETS[r.day.cardio].name}\n2) Fuerza — ${r.day.title}:\n${r.day.items.map((it) => `• ${EXERCISES[it.ex].name}: ${it.sets} × ${it.reps}`).join('\n')}\n\nAbre Mi Entreno: ${location.origin + location.pathname}`
+      : r.body;
+    L.push('BEGIN:VEVENT', `UID:mientreno-${WD_ICS[wd]}@angelleiva-dev.github.io`, `DTSTAMP:${stamp}`, `DTSTART:${dt}`, 'DURATION:PT1H',
+      `RRULE:FREQ=WEEKLY;BYDAY=${WD_ICS[wd]}`, icsFold(`SUMMARY:${icsEsc(r.day ? `🏋️ Entreno: ${r.day.title}` : '🚶 Caminata / descanso activo')}`),
+      icsFold(`DESCRIPTION:${icsEsc(desc)}`), 'BEGIN:VALARM', 'ACTION:DISPLAY', icsFold(`DESCRIPTION:${icsEsc(r.title)}`), 'TRIGGER:PT0S', 'END:VALARM', 'END:VEVENT');
+  }
+  L.push('END:VCALENDAR');
+  return L.join('\r\n') + '\r\n';
+}
+function downloadICS() {
+  if (!S.reminder.days.length) { toast('Elige al menos un día'); return; }
+  const ics = buildICS();
+  if (isIOS()) { location.href = 'data:text/calendar;charset=utf-8,' + encodeURIComponent(ics); return; }
+  const blob = new Blob([ics], { type: 'text/calendar;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'mi-entreno-recordatorios.ics';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  toast('Abre el archivo descargado para agregarlo');
+}
+
 // ---------------------------------------------------------------- Inicio
 setInterval(() => { if (T.phases && tab !== 'cardio') updateTopDate(); }, 1000);
 go('hoy');
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.register('sw.js').then(() => syncReminderState()).catch(() => {});
 }
+setInterval(checkReminder, 60 * 1000);
+setTimeout(checkReminder, 3000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkReminder(); });
